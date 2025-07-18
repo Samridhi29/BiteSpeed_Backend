@@ -1,4 +1,5 @@
 import { PrismaClient, Contact } from "@prisma/client";
+import { buildContactGraph } from "../utils/contactGraph";
 
 const prisma = new PrismaClient();
 
@@ -13,7 +14,11 @@ export async function reconcileContact(
   email?: string,
   phoneNumber?: string
 ): Promise<Reconciled> {
-  // 1. find existing matches
+  if (!email && !phoneNumber) {
+    throw { statusCode: 400, message: "At least one of email or phoneNumber is required." };
+  }
+
+  // 1. Find any direct matches by email or phone
   const matches = await prisma.contact.findMany({
     where: {
       OR: [
@@ -23,7 +28,7 @@ export async function reconcileContact(
     },
   });
 
-  // 2. no matches → create primary
+  // 2. No matches → create new primary contact
   if (matches.length === 0) {
     const created = await prisma.contact.create({
       data: { email, phoneNumber, linkPrecedence: "primary" },
@@ -36,51 +41,29 @@ export async function reconcileContact(
     };
   }
 
-  // 3. collect full linked set via BFS
-  const queue = matches.map((c) => c.id);
-  const visited = new Set<number>();
-  while (queue.length) {
-    const id = queue.shift()!;
-    if (visited.has(id)) continue;
-    visited.add(id);
+  // 3. Build full graph of linked contacts
+  const linkedContacts = await buildContactGraph(matches[0].id);
 
-    const c = await prisma.contact.findUnique({
-      where: { id },
-      include: { secondaries: true },
-    });
-    if (!c) continue;
-    if (c.linkedId) queue.push(c.linkedId);
-    c.secondaries.forEach((s) => queue.push(s.id));
-  }
-
-  // 4. load all linked contacts sorted by creation time
-  const linkedContacts = await prisma.contact.findMany({
-    where: { id: { in: Array.from(visited) } },
-    orderBy: { createdAt: "asc" },
-  });
-
-  // 5. the oldest is primary
+  // 4. Determine the primary (oldest createdAt)
+  linkedContacts.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
   const primary = linkedContacts[0];
 
-  // 6. demote any other primaries
+  // 5. Demote any other “primary” record to secondary && link to true primary
   await Promise.all(
-    linkedContacts.slice(1).map((c) =>
-      c.linkPrecedence === "primary"
-        ? prisma.contact.update({
-            where: { id: c.id },
-            data: { linkPrecedence: "secondary", linkedId: primary.id },
-          })
-        : Promise.resolve()
-    )
+    linkedContacts.slice(1)
+      .filter(c => c.linkPrecedence === "primary")
+      .map(c =>
+        prisma.contact.update({
+          where: { id: c.id },
+          data: { linkPrecedence: "secondary", linkedId: primary.id },
+        })
+      )
   );
 
-  // 7. add new secondary if new info present
-  const existingEmails = new Set(
-    linkedContacts.map((c) => c.email).filter(Boolean) as string[]
-  );
-  const existingPhones = new Set(
-    linkedContacts.map((c) => c.phoneNumber).filter(Boolean) as string[]
-  );
+  // 6. If new email/phone, create a secondary record
+  const existingEmails = new Set(linkedContacts.map(c => c.email).filter(Boolean) as string[]);
+  const existingPhones = new Set(linkedContacts.map(c => c.phoneNumber).filter(Boolean) as string[]);
+
   if (
     (email && !existingEmails.has(email)) ||
     (phoneNumber && !existingPhones.has(phoneNumber))
@@ -95,21 +78,25 @@ export async function reconcileContact(
     });
   }
 
-  // 8. final fetch of primary + secondaries
-  const final = await prisma.contact.findMany({
+  // 7. Fetch final list of primary + secondaries
+  const finalContacts = await prisma.contact.findMany({
     where: {
       OR: [{ id: primary.id }, { linkedId: primary.id }],
     },
   });
 
+  // 8. Build response payload
   return {
     primaryContactId: primary.id,
-    emails: Array.from(new Set(final.map((c) => c.email).filter(Boolean) as string[])),
-    phoneNumbers: Array.from(
-      new Set(final.map((c) => c.phoneNumber).filter(Boolean) as string[])
+    emails: Array.from(
+      new Set(finalContacts.map(c => c.email).filter(Boolean) as string[])
     ),
-    secondaryContactIds: final
-      .filter((c) => c.linkPrecedence === "secondary")
-      .map((c) => c.id),
+    phoneNumbers: Array.from(
+      new Set(finalContacts.map(c => c.phoneNumber).filter(Boolean) as string[])
+    ),
+    secondaryContactIds: finalContacts
+      .filter(c => c.linkPrecedence === "secondary")
+      .map(c => c.id),
   };
 }
+
