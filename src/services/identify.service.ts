@@ -18,7 +18,7 @@ export async function reconcileContact(
     throw { statusCode: 400, message: "At least one of email or phoneNumber is required." };
   }
 
-  // 1. Find any direct matches by email or phone
+  //Find any direct matches by email or phone
   const matches = await prisma.contact.findMany({
     where: {
       OR: [
@@ -28,7 +28,7 @@ export async function reconcileContact(
     },
   });
 
-  // 2. No matches → create new primary contact
+  //No matches → create new primary contact
   if (matches.length === 0) {
     const created = await prisma.contact.create({
       data: { email, phoneNumber, linkPrecedence: "primary" },
@@ -41,14 +41,14 @@ export async function reconcileContact(
     };
   }
 
-  // 3. Build full graph of linked contacts
+  //Build full graph of linked contacts
   const linkedContacts = await buildContactGraph(matches[0].id);
 
-  // 4. Determine the primary (oldest createdAt)
+  //Determine the primary (oldest createdAt)
   linkedContacts.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
   const primary = linkedContacts[0];
 
-  // 5. Demote any other “primary” record to secondary && link to true primary
+  //Demote any other “primary” record to secondary && link to true primary
   await Promise.all(
     linkedContacts.slice(1)
       .filter(c => c.linkPrecedence === "primary")
@@ -60,7 +60,7 @@ export async function reconcileContact(
       )
   );
 
-  // 6. If new email/phone, create a secondary record
+  // If new email/phone, create a secondary record
   const existingEmails = new Set(linkedContacts.map(c => c.email).filter(Boolean) as string[]);
   const existingPhones = new Set(linkedContacts.map(c => c.phoneNumber).filter(Boolean) as string[]);
 
@@ -78,14 +78,14 @@ export async function reconcileContact(
     });
   }
 
-  // 7. Fetch final list of primary + secondaries
+  //Fetch final list of primary + secondaries
   const finalContacts = await prisma.contact.findMany({
     where: {
       OR: [{ id: primary.id }, { linkedId: primary.id }],
     },
   });
 
-  // 8. Build response payload
+  //Build response payload
   return {
     primaryContactId: primary.id,
     emails: Array.from(
